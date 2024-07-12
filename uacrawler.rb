@@ -6,9 +6,17 @@ require 'erb'
 
 include ERB::Util
 
-@log = Logger.new "/tmp/mechanize.txt"
+@site = ARGV[0].gsub(/.*\/\//, '')
+          .gsub(/\/.*/, '')
+          .gsub(/^.*[:@]/, '')
+          .gsub(/^/, 'https://')
+
+return unless @site.match?(/\./)
+return if @site.match?(/\.[^.]*[0-9][^.]*$/)
+
+@log = Logger.new "/tmp/mechanize-#{@site.gsub(/.*\/\//, '')}.txt"
 @log.level = Logger::DEBUG
-@end = Time.now + 6
+@end = Time.now + 30
 
 def relevant?(uri)
   (uri != nil &&
@@ -108,7 +116,9 @@ class EmailishForm
 
   def detectWordpress
     @page.image_urls.any? do |u|
-      u.host == @page.uri.host &&
+      u.respond_to?(:host) &&
+        u.respond_to?(:path) &&
+        u.host == @page.uri.host &&
         u.path.kind_of?(String) &&
         u.path.match?(/^\/wp-/)
     end
@@ -120,13 +130,13 @@ class EmailishForm
 end
 
 def process(page)
- distance = @distances[page.uri]
+  distance = @distances[page.uri]
   if page.kind_of?(Mechanize::Page) && distance < 3 then
     links = page.links
               .map{ |l| l.resolved_uri rescue nil }
               .select{ |u| relevant?(u) }
               .map{ |u| u.fragment = nil ; u }
-    links.each { |u| @distances[u] = [distance + 1, (@distances[u] || 4)].min }
+    links.each{|u| @distances[u] = [distance + 1, (@distances[u] || 4)].min }
     links.select{ |u| unseen?(u) }.each { |u| @unprocessed.add(u) }
   end
   if page.forms.any? { |f| f.fields.any? { |i| emailish?(i) } } then
@@ -140,19 +150,28 @@ def mechanize()
   m
 end
 
-start = mechanize.get(ARGV[0])
+begin
+  start = mechanize.get(@site)
+rescue Exception => e
+  puts "<p>Unable to retrieve #{@site}: #{e}\n"
+  return
+end
 
 @host = start.uri.host
 @port = start.uri.port
 @scheme = start.uri.scheme
 
+@failed = Set.new
 @processed = Set.new
 @unprocessed = Set.new
 @forms = {}
 @distances = { start.uri => 0}
+@retrievals = []
 
 process(start)
 @processed.add(start.uri)
+
+Thread.report_on_exception = false
 
 progress = true;
 while progress do
@@ -163,34 +182,53 @@ while progress do
     .sort_by{ |k, _v| k.path.length }
     .sort_by{ |_k, v| v }
     .map{ |k, _v| k }
-    .select{ |u| !@processed.include?(u) }.each do |uri|
+    .select{|u| !@processed.include?(u) && !@failed.include?(u)}.each do |uri|
       queues[i] ||= []
       queues[i] << uri
       i = i + 1;
-      i = 0 if i > 9;
+      i = 0 if i > 7;
   end
   threads = []
   @fetched = []
   @lock = Mutex.new
+  @timedout = false;
   queues.each do |q|
     threads << Thread.new do
+    #begin
       m = mechanize
       m.redirect_ok = false
       m.request_headers = {
         'Accept' => 'text/html',
-        'Referer' => start.canonical_uri
+        'Referer' => start.uri
       }
       q.each do |uri|
         if @processed.count + @fetched.count + queues.count < 53 && Time.now < @end then
-          page = m.get(uri) rescue nil
-          if page.kind_of?(Mechanize::Page) then
-            @lock.synchronize { @fetched << page }
+          s = Time.now;
+          page = nil
+          begin
+            page = m.get(uri)
+          rescue Mechanize::ResponseCodeError => e
+            @lock.synchronize { @failed.add(uri) }
+          rescue => e
+            puts "<p>Exception #{e} for #{uri}.\n"
+          else
+            if @timedout then
+              @lock.synchronize { @failed.add(uri) }
+            elsif page.kind_of?(Mechanize::Page) then
+              @lock.synchronize do
+                @fetched << page
+                @retrievals << (Time.now - s)
+              end
+            end
           end
         end
       end
     end
   end
-  threads.each { |t| t.join }
+  while Time.now < @end && threads.any?{|t| t.alive?} do
+    sleep(0.05)
+  end
+  @timedout = true
   @fetched.each do |page|
     @processed.add(page.uri)
     process(page) rescue nil
@@ -198,8 +236,8 @@ while progress do
   end
 end
 
-
 puts "<p>Checked #{@processed.count} pages on #{@host} and found #{@forms.count} relevant forms.\n"
+
 
 bad = @forms.values.select { |f| !f.uaReady? }
 if @forms.empty? then
@@ -215,7 +253,7 @@ else
     if problems.include?(problem) then
       repeated = repeated + 1
     else
-      puts "<li><a href=\"#{f.page.uri}\">#{h(f.page.title)}</a>: #{problem}\n"
+      puts "<li><a rel=\"nofollow\" href=\"#{f.page.uri}\">#{h(f.page.title)}</a>: #{problem}\n"
       problems << problem
     end
   end
@@ -223,4 +261,16 @@ else
   if repeated > 0 then
     puts "<p>#{repeated} more pages have the same potential problems.\n"
   end
+end
+
+@retrievals = @retrievals.sort
+if @retrievals.length > 1 then
+  median = @retrievals[@retrievals.count/2].truncate(3)
+  if median > 0.15 then
+    puts "<p>(Slow server detected: fastest page #{@retrievals.first.truncate(3)}s, median #{median}s, slowest #{@retrievals.last.truncate(3)}s.)\n"
+  end
+end
+
+if @failed.count > 2 then
+  puts "<p>(Retrieving #{@failed.count} pages failed due to HTTP errors or a slow server.)\n"
 end
