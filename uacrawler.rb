@@ -1,7 +1,6 @@
 require 'bundler/setup'
 require 'mechanize'
 require "logger"
-require 'byebug'
 require 'erb'
 
 include ERB::Util
@@ -14,8 +13,6 @@ include ERB::Util
 return unless @site.match?(/\./)
 return if @site.match?(/\.[^.]*[0-9][^.]*$/)
 
-@log = Logger.new "/tmp/mechanize-#{@site.gsub(/.*\/\//, '')}.txt"
-@log.level = Logger::DEBUG
 @end = Time.now + 30
 
 def relevant?(uri)
@@ -145,7 +142,7 @@ def process(page)
 end
 
 def mechanize()
-  m = Mechanize.new{ |a| a.log = @log }
+  m = Mechanize.new
   m.user_agent = 'uasg.tech-UAChecker/0.1'
   m
 end
